@@ -1,0 +1,7 @@
+app = "Weclome Bot" # will be filled during fly launch
+
+[env]
+PORT = "3000"
+
+[build]
+  command = "npm install && npm run start"
