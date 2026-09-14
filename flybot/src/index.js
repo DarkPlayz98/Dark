@@ -11,11 +11,14 @@ const PORT = Number(env('PORT', '8080'));
 if (!DISCORD_TOKEN) throw new Error('DISCORD_TOKEN is required');
 if (!TARGET_CHANNEL_ID) throw new Error('TARGET_CHANNEL_ID is required');
 if (!BRAIN_WEBHOOK_SECRET) throw new Error('BRAIN_WEBHOOK_SECRET is required');
+if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) throw new Error('PORT must be 1-65535');
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+
 let lastSignal = null;
 let lastMessage = null;
 let messagesSent = 0;
+let lastActionAt = 0;
 
 const ACTIONS = {
   forward: '🪰 I am moving forward.',
@@ -34,6 +37,7 @@ function pickAction(signals = {}) {
 
   if (!candidates.length) return null;
   candidates.sort((a, b) => b[1] - a[1]);
+
   const [name, score] = candidates[0];
   return score > 0 ? { name, score } : null;
 }
@@ -41,6 +45,12 @@ function pickAction(signals = {}) {
 async function sendFlyMessage(payload) {
   const action = pickAction(payload?.signals);
   if (!action) return { sent: false, reason: 'No positive mapped motor signal.' };
+
+  // Prevent a fast simulator from flooding a Discord channel.
+  const now = Date.now();
+  if (now - lastActionAt < 1000) {
+    return { sent: false, reason: 'Rate limited; wait at least 1 second between messages.' };
+  }
 
   const channel = await client.channels.fetch(TARGET_CHANNEL_ID);
   if (!channel?.isTextBased()) throw new Error('TARGET_CHANNEL_ID is not a text channel');
@@ -51,6 +61,7 @@ async function sendFlyMessage(payload) {
   lastSignal = payload;
   lastMessage = message.createdAt.toISOString();
   messagesSent += 1;
+  lastActionAt = now;
 
   return { sent: true, action, messageId: message.id };
 }
@@ -82,7 +93,13 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'GET' && url.pathname === '/health') {
     res.writeHead(200);
-    res.end(JSON.stringify({ ok: true, discordReady: client.isReady(), messagesSent }));
+    res.end(JSON.stringify({
+      ok: true,
+      discordReady: client.isReady(),
+      messagesSent,
+      lastMessage,
+      lastSignal,
+    }));
     return;
   }
 
@@ -108,6 +125,42 @@ const server = http.createServer(async (req, res) => {
 
   res.writeHead(404);
   res.end(JSON.stringify({ error: 'Not found' }));
+});
+
+client.on('interactionCreate', async interaction => {
+  if (!interaction.isChatInputCommand() || interaction.commandName !== 'fly') return;
+
+  const subcommand = interaction.options.getSubcommand();
+
+  if (subcommand === 'status') {
+    await interaction.reply({
+      ephemeral: true,
+      content: [
+        '🪰 FlyBot status',
+        `Discord: ${client.isReady() ? 'online' : 'offline'}`,
+        `Brain gateway: ${server.listening ? 'listening' : 'offline'}`,
+        `Messages sent: ${messagesSent}`,
+        `Last action: ${lastSignal ? JSON.stringify(lastSignal.signals ?? {}) : 'none'}`,
+      ].join('\n'),
+    });
+    return;
+  }
+
+  if (subcommand === 'test') {
+    try {
+      const result = await sendFlyMessage({
+        source: 'manual-test',
+        signals: { explore: 1 },
+      });
+
+      await interaction.reply({
+        ephemeral: true,
+        content: result.sent ? `✅ Test signal sent as ${result.action.name}.` : `⚠️ ${result.reason}`,
+      });
+    } catch (error) {
+      await interaction.reply({ ephemeral: true, content: `❌ ${error.message}` });
+    }
+  }
 });
 
 client.once('ready', () => {
